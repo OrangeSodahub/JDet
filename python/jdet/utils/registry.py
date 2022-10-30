@@ -46,6 +46,7 @@ def build_from_cfg(cfg,registry,**kwargs):
         raise TypeError(f"type {type(cfg)} not support")
 
 
+ASSINGER = Registry()
 DATASETS = Registry()
 TRANSFORMS = Registry()
 MODELS = Registry()
@@ -56,6 +57,7 @@ OPTIMS = Registry()
 BRICKS = Registry()
 NECKS = Registry()
 SCHEDULERS = Registry()
+SAMPLER = Registry()
 BOXES = Registry()
 HOOKS = Registry()
 

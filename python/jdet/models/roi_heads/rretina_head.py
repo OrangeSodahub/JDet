@@ -1,9 +1,12 @@
-from numpy import multiply
+from abc import ABCMeta, abstractmethod
 import jittor as jt 
 from jittor import nn
-from jdet.utils.registry import build_from_cfg,HEADS
+from jdet.utils.registry import build_from_cfg
+from jdet.utils.registry import HEADS, BOXES, LOSSES, ASSINGER, SAMPLER
 from jdet.models.utils.modules import ConvModule
-from jdet.models.utils.weight_init import normal_init,bias_init_with_prob
+
+from jdet.utils.misc import multi_apply
+from jdet.models.utils.weight_init import normal_init, bias_init_with_prob
 
 class BaseDenseHead(nn.Module, metaclass=ABCMeta):
     """Base class for DenseHeads"""
@@ -66,22 +69,27 @@ class AnchorHead(BaseDenseHead):
                  in_channels,
                  feat_channels=256,
                  anchor_generator=dict(
-                     type='AnchorGenerator',
-                     scales=[8, 16, 32],
-                     ratios=[0.5, 1.0, 2.0],
-                     strides=[4, 8, 16, 32, 64]),
+                     type='RotatedAnchorGenerator',
+                     octave_base_scale=4,
+                     scales_per_octave=3,
+                     ratios=[1.0, 0.5, 2.0],
+                     strides=[8, 16, 32, 64, 128]),
                  bbox_coder=dict(
-                     type='DeltaXYWHBBoxCoder',
-                     target_means=(.0, .0, .0, .0),
-                     target_stds=(1.0, 1.0, 1.0, 1.0)),
+                     type='DeltaXYWHAOBBoxCoder',
+                     target_means=(.0, .0, .0, .0, .0),
+                     target_stds=(1.0, 1.0, 1.0, 1.0, 1.0)),
                  reg_decoded_bbox=False,
                  background_label=None,
                  loss_cls=dict(
-                     type='CrossEntropyLoss',
+                     type='FocalLoss',
                      use_sigmoid=True,
+                     gamma=2.0,
+                     alpha=0.25,
                      loss_weight=1.0),
                  loss_bbox=dict(
-                     type='SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.0),
+                     type='SmoothL1Loss',
+                     beta=1.0 / 9.0,
+                     loss_weight=1.0),
                  train_cfg=None,
                  test_cfg=None):
         super(AnchorHead, self).__init__()
@@ -106,22 +114,22 @@ class AnchorHead(BaseDenseHead):
         assert (self.background_label == 0
                 or self.background_label == num_classes)
 
-        self.bbox_coder = build_bbox_coder(bbox_coder)
-        self.loss_cls = build_loss(loss_cls)
-        self.loss_bbox = build_loss(loss_bbox)
+        self.bbox_coder = build_from_cfg(bbox_coder, BOXES)
+        self.loss_cls = build_from_cfg(loss_cls, LOSSES)
+        self.loss_bbox = build_from_cfg(loss_bbox, LOSSES)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         if self.train_cfg:
-            self.assigner = build_assigner(self.train_cfg.assigner)
+            self.assigner = build_from_cfg(self.train_cfg.assigner, ASSINGER)
             # use PseudoSampler when sampling is False
             if self.sampling and hasattr(self.train_cfg, 'sampler'):
                 sampler_cfg = self.train_cfg.sampler
             else:
                 sampler_cfg = dict(type='PseudoSampler')
-            self.sampler = build_sampler(sampler_cfg, context=self)
+            self.sampler = build_from_cfg(sampler_cfg, SAMPLER)
         self.fp16_enabled = False
 
-        self.anchor_generator = build_anchor_generator(anchor_generator)
+        self.anchor_generator = build_from_cfg(anchor_generator, BOXES)
         # usually the numbers of anchors for each level are the same
         # except SSD detectors
         self.num_anchors = self.anchor_generator.num_base_anchors[0]
@@ -132,16 +140,41 @@ class AnchorHead(BaseDenseHead):
                                   self.num_anchors * self.cls_out_channels, 1)
         self.conv_reg = nn.Conv2d(self.in_channels, self.num_anchors * 4, 1)
 
-    def init_weights(self):
-        normal_init(self.conv_cls, std=0.01)
-        normal_init(self.conv_reg, std=0.01)
-
     def forward_single(self, x):
+        """Forward feature of a single scale level.
+
+        Args:
+            x (torch.Tensor): Features of a single scale level.
+
+        Returns:
+            tuple (torch.Tensor):
+
+                - cls_score (torch.Tensor): Cls scores for a single scale \
+                    level the channels number is num_anchors * num_classes.
+                - bbox_pred (torch.Tensor): Box energies / deltas for a \
+                    single scale level, the channels number is num_anchors * 5.
+        """
         cls_score = self.conv_cls(x)
         bbox_pred = self.conv_reg(x)
         return cls_score, bbox_pred
 
     def forward(self, feats):
+        """Forward features from the upstream network.
+
+        Args:
+            feats (tuple[Tensor]): Features from the upstream network, each is
+                a 4D-tensor.
+
+        Returns:
+            tuple: A tuple of classification scores and bbox prediction.
+
+                - cls_scores (list[Tensor]): Classification scores for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_anchors * num_classes.
+                - bbox_preds (list[Tensor]): Box energies / deltas for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_anchors * 5.
+        """
         return multi_apply(self.forward_single, feats)
 
     def get_anchors(self, featmap_sizes, img_metas, device='cuda'):
