@@ -2,13 +2,13 @@ from abc import ABCMeta, abstractmethod
 
 import jittor as jt 
 from jittor import nn
+
 from jdet.utils.general import multi_apply, unmap
 from jdet.utils.registry import build_from_cfg
 from jdet.utils.registry import HEADS, BOXES, LOSSES
 from jdet.models.utils.modules import ConvModule
-
-from jdet.utils.misc import multi_apply
 from jdet.models.utils.weight_init import normal_init, bias_init_with_prob
+from jdet.models.utils.bbox_nms_rotated import multiclass_nms_rotated
 
 class BaseDenseHead(nn.Module, metaclass=ABCMeta):
     """Base class for DenseHeads"""
@@ -594,9 +594,33 @@ class AnchorHead(BaseDenseHead):
                            img_shape,
                            scale_factor,
                            cfg,
-                           rescale=False):
+                           rescale=False,
+                           with_nms=True):
         """
         Transform outputs for a single batch item into labeled boxes.
+
+        Args:
+            cls_score_list (list[Tensor]): Box scores for a single scale level
+                Has shape (num_anchors * num_classes, H, W).
+            bbox_pred_list (list[Tensor]): Box energies / deltas for a single
+                scale level with shape (num_anchors * 4, H, W).
+            mlvl_anchors (list[Tensor]): Box reference for a single scale level
+                with shape (num_total_anchors, 4).
+            img_shape (tuple[int]): Shape of the input image,
+                (height, width, 3).
+            scale_factor (ndarray): Scale factor of the image arange as
+                (w_scale, h_scale, w_scale, h_scale).
+            cfg (mmcv.Config): Test / postprocessing configuration,
+                if None, test_cfg would be used.
+            rescale (bool): If True, return boxes in original image space.
+                Default: False.
+            with_nms (bool): If True, do nms before return boxes.
+                Default: True.
+
+        Returns:
+            Tensor: Labeled boxes in shape (n, 5), where the first 4 columns
+                are bounding box positions (cx, cy, w, h, a) and the
+                6-th column is a score between 0 and 1.
         """
         cfg = self.test_cfg if cfg is None else cfg
         assert len(cls_score_list) == len(bbox_pred_list) == len(mlvl_anchors)
@@ -630,20 +654,26 @@ class AnchorHead(BaseDenseHead):
                 anchors, bbox_pred, max_shape=img_shape)
             mlvl_bboxes.append(bboxes)
             mlvl_scores.append(scores)
-        mlvl_bboxes = torch.cat(mlvl_bboxes)
+        mlvl_bboxes = jt.concat(mlvl_bboxes)
         if rescale:
-            mlvl_bboxes /= mlvl_bboxes.new_tensor(scale_factor)
-        mlvl_scores = torch.cat(mlvl_scores)
+            # angle should not be rescaled
+            mlvl_bboxes[:, :4] = mlvl_bboxes[:, :4] / scale_factor
+        mlvl_scores = jt.concat(mlvl_scores)
         if self.use_sigmoid_cls:
             # Add a dummy background class to the backend when using sigmoid
             # remind that we set FG labels to [0, num_class-1] since mmdet v2.0
             # BG cat_id: num_class
             padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
-            mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
-        det_bboxes, det_labels = multiclass_nms(mlvl_bboxes, mlvl_scores,
-                                                cfg.score_thr, cfg.nms,
-                                                cfg.max_per_img)
-        return det_bboxes, det_labels
+            mlvl_scores = jt.concat([mlvl_scores, padding], dim=1)
+
+        if with_nms:
+            # TODO: multiclass_nms_rotated
+            det_bboxes, det_labels = multiclass_nms_rotated(
+                mlvl_bboxes, mlvl_scores, cfg.score_thr, cfg.nms,
+                cfg.max_per_img)
+            return det_bboxes, det_labels
+        else:
+            return mlvl_bboxes, mlvl_scores
 
 
 @HEADS.register_module()
