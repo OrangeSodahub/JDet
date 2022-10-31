@@ -2,6 +2,7 @@ from abc import ABCMeta, abstractmethod
 
 import jittor as jt 
 from jittor import nn
+from jdet.utils.general import multi_apply, unmap
 from jdet.utils.registry import build_from_cfg
 from jdet.utils.registry import HEADS, BOXES, LOSSES
 from jdet.models.utils.modules import ConvModule
@@ -505,7 +506,7 @@ class AnchorHead(BaseDenseHead):
             num_total_samples=num_total_samples)
         return dict(loss_cls=losses_cls, loss_bbox=losses_bbox)
 
-    @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
+    # TODO: @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
     def get_bboxes(self,
                    cls_scores,
                    bbox_preds,
@@ -519,11 +520,15 @@ class AnchorHead(BaseDenseHead):
             cls_scores (list[Tensor]): Box scores for each scale level
                 Has shape (N, num_anchors * num_classes, H, W)
             bbox_preds (list[Tensor]): Box energies / deltas for each scale
-                level with shape (N, num_anchors * 4, H, W)
-            img_metas (list[dict]): Size / scale info for each image
-            cfg (mmcv.Config): Test / postprocessing configuration,
+                level with shape (N, num_anchors * 5, H, W)
+            img_metas (list[dict]): Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+            cfg (mmcv.Config | None): Test / postprocessing configuration,
                 if None, test_cfg would be used
-            rescale (bool): If True, return boxes in original image space
+            rescale (bool): If True, return boxes in original image space.
+                Default: False.
+            with_nms (bool): If True, do nms before return boxes.
+                Default: True.
 
         Returns:
             list[tuple[Tensor, Tensor]]: Each item in result_list is 2-tuple.
@@ -562,10 +567,9 @@ class AnchorHead(BaseDenseHead):
         assert len(cls_scores) == len(bbox_preds)
         num_levels = len(cls_scores)
 
-        device = cls_scores[0].device
         featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
         mlvl_anchors = self.anchor_generator.grid_anchors(
-            featmap_sizes, device=device)
+            featmap_sizes) # device set to 'cuda'
 
         result_list = []
         for img_id in range(len(img_metas)):
@@ -1247,18 +1251,6 @@ def rotated_anchor_inside_flags(flat_anchors,
         inside_flags = valid_flags
 
     return inside_flags
-
-def unmap(data, count, inds, fill=0):
-    """Unmap a subset of item (data) back to the original set of items (of size
-    count)"""
-    if data.ndim == 1:
-        ret = jt.full((count, ), fill)
-        ret[jt.bool(inds)] = data
-    else:
-        new_size = (count, ) + data.size()[1:]
-        ret = jt.full(new_size, fill)
-        ret[jt.bool(inds), :] = data
-    return ret
 
 
 def images_to_levels(target, num_levels):
