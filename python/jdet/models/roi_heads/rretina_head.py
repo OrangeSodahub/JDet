@@ -145,14 +145,14 @@ class AnchorHead(BaseDenseHead):
         """Forward feature of a single scale level.
 
         Args:
-            x (torch.Tensor): Features of a single scale level.
+            x (jittor.Var): Features of a single scale level.
 
         Returns:
-            tuple (torch.Tensor):
+            tuple (jittor.Var):
 
-                - cls_score (torch.Tensor): Cls scores for a single scale \
+                - cls_score (jittor.Var): Cls scores for a single scale \
                     level the channels number is num_anchors * num_classes.
-                - bbox_pred (torch.Tensor): Box energies / deltas for a \
+                - bbox_pred (jittor.Var): Box energies / deltas for a \
                     single scale level, the channels number is num_anchors * 5.
         """
         cls_score = self.conv_cls(x)
@@ -408,13 +408,38 @@ class AnchorHead(BaseDenseHead):
 
     def loss_single(self, cls_score, bbox_pred, anchors, labels, label_weights,
                     bbox_targets, bbox_weights, num_total_samples):
+        """Compute loss of a single scale level.
+
+        Args:
+            cls_score (jittor.Var): Box scores for each scale level
+                Has shape (N, num_anchors * num_classes, H, W).
+            bbox_pred (jittor.Var): Box energies / deltas for each scale
+                level with shape (N, num_anchors * 5, H, W).
+            anchors (jittor.Var): Box reference for each scale level with
+                shape (N, num_total_anchors, 5).
+            labels (jittor.Var): Labels of each anchors with shape
+                (N, num_total_anchors).
+            label_weights (jittor.Var): Label weights of each anchor with
+                shape (N, num_total_anchors)
+            bbox_targets (jittor.Var): BBox regression targets of each anchor
+            weight shape (N, num_total_anchors, 5).
+            bbox_weights (jittor.Var): BBox regression loss weights of each
+                anchor with shape (N, num_total_anchors, 5).
+            num_total_samples (int): If sampling, num total samples equal to
+                the number of total anchors; Otherwise, it is the number of
+                positive anchors.
+
+        Returns:
+            tuple (jittor.Var):
+
+                - loss_cls (jittor.Var): cls. loss for each scale level.
+                - loss_bbox (jittor.Var): reg. loss for each scale level.
+        """
         # classification loss
         labels = labels.reshape(-1)
         label_weights = label_weights.reshape(-1)
-        cls_score = cls_score.permute(0, 2, 3,
-                                      1).reshape(-1, self.cls_out_channels)
-        loss_cls = self.loss_cls(
-            cls_score, labels, label_weights, avg_factor=num_total_samples)
+        cls_score = cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels)
+        loss_cls = self.loss_cls(cls_score, labels, label_weights, avg_factor=num_total_samples)
         # regression loss
         bbox_targets = bbox_targets.reshape(-1, 4)
         bbox_weights = bbox_weights.reshape(-1, 4)
@@ -1200,8 +1225,8 @@ def rotated_anchor_inside_flags(flat_anchors,
     """Check whether the rotated anchors are inside the border.
 
     Args:
-        flat_anchors (torch.Tensor): Flatten anchors, shape (n, 5).
-        valid_flags (torch.Tensor): An existing valid flags of anchors.
+        flat_anchors (jittor.Var): Flatten anchors, shape (n, 5).
+        valid_flags (jittor.Var): An existing valid flags of anchors.
         img_shape (tuple(int)): Shape of current image.
         allowed_border (int, optional): The border to allow the valid anchor.
             Defaults to 0.
