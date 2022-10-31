@@ -321,29 +321,29 @@ class AnchorHead(BaseDenseHead):
             multiple images.
 
         Args:
-            anchor_list (list[list[Tensor]]): Multi level anchors of each
+            anchor_list (list[list[Var]]): Multi level anchors of each
                 image. The outer list indicates images, and the inner list
                 corresponds to feature levels of the image. Each element of
-                the inner list is a tensor of shape (num_anchors, 4).
-            valid_flag_list (list[list[Tensor]]): Multi level valid flags of
+                the inner list is a Var of shape (num_anchors, 4).
+            valid_flag_list (list[list[Var]]): Multi level valid flags of
                 each image. The outer list indicates images, and the inner list
                 corresponds to feature levels of the image. Each element of
-                the inner list is a tensor of shape (num_anchors, )
-            gt_bboxes_list (list[Tensor]): Ground truth bboxes of each image.
+                the inner list is a Var of shape (num_anchors, )
+            gt_bboxes_list (list[Var]): Ground truth bboxes of each image.
             img_metas (list[dict]): Meta info of each image.
-            gt_bboxes_ignore_list (list[Tensor]): Ground truth bboxes to be
+            gt_bboxes_ignore_list (list[Var]): Ground truth bboxes to be
                 ignored.
-            gt_labels_list (list[Tensor]): Ground truth labels of each box.
+            gt_labels_list (list[Var]): Ground truth labels of each box.
             label_channels (int): Channel of label.
             unmap_outputs (bool): Whether to map outputs back to the original
                 set of anchors.
 
         Returns:
             tuple:
-                labels_list (list[Tensor]): Labels of each level
-                label_weights_list (list[Tensor]): Label weights of each level
-                bbox_targets_list (list[Tensor]): BBox targets of each level
-                bbox_weights_list (list[Tensor]): BBox weights of each level
+                labels_list (list[Var]): Labels of each level
+                label_weights_list (list[Var]): Label weights of each level
+                bbox_targets_list (list[Var]): BBox targets of each level
+                bbox_weights_list (list[Var]): BBox weights of each level
                 num_total_pos (int): Number of positive samples in all images
                 num_total_neg (int): Number of negative samples in all images
             additional_returns: This function enables user-defined returns from
@@ -362,8 +362,8 @@ class AnchorHead(BaseDenseHead):
         concat_valid_flag_list = []
         for i in range(num_imgs):
             assert len(anchor_list[i]) == len(valid_flag_list[i])
-            concat_anchor_list.append(torch.cat(anchor_list[i]))
-            concat_valid_flag_list.append(torch.cat(valid_flag_list[i]))
+            concat_anchor_list.append(jt.concat(anchor_list[i]))
+            concat_valid_flag_list.append(jt.concat(valid_flag_list[i]))
 
         # compute targets for each image
         if gt_bboxes_ignore_list is None:
@@ -1235,3 +1235,19 @@ def unmap(data, count, inds, fill=0):
         ret = jt.full(new_size, fill)
         ret[jt.bool(inds), :] = data
     return ret
+
+
+def images_to_levels(target, num_levels):
+    """Convert targets by image to targets by feature level.
+
+    [target_img0, target_img1] -> [target_level0, target_level1, ...]
+    """
+    target = jt.stack(target, 0)
+    level_targets = []
+    start = 0
+    for n in num_levels:
+        end = start + n
+        # level_targets.append(target[:, start:end].squeeze(0))
+        level_targets.append(target[:, start:end])
+        start = end
+    return level_targets
