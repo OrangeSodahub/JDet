@@ -1,8 +1,9 @@
 from abc import ABCMeta, abstractmethod
+
 import jittor as jt 
 from jittor import nn
 from jdet.utils.registry import build_from_cfg
-from jdet.utils.registry import HEADS, BOXES, LOSSES, ASSINGER, SAMPLER
+from jdet.utils.registry import HEADS, BOXES, LOSSES
 from jdet.models.utils.modules import ConvModule
 
 from jdet.utils.misc import multi_apply
@@ -94,7 +95,6 @@ class AnchorHead(BaseDenseHead):
                  test_cfg=None):
         super(AnchorHead, self).__init__()
         self.in_channels = in_channels
-        self.num_classes = num_classes
         self.feat_channels = feat_channels
         self.use_sigmoid_cls = loss_cls.get('use_sigmoid', False)
         # TODO better way to determine whether sample or not
@@ -114,19 +114,20 @@ class AnchorHead(BaseDenseHead):
         assert (self.background_label == 0
                 or self.background_label == num_classes)
 
+        self.reg_decoded_bbox = reg_decoded_bbox
         self.bbox_coder = build_from_cfg(bbox_coder, BOXES)
         self.loss_cls = build_from_cfg(loss_cls, LOSSES)
         self.loss_bbox = build_from_cfg(loss_bbox, LOSSES)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         if self.train_cfg:
-            self.assigner = build_from_cfg(self.train_cfg.assigner, ASSINGER)
+            self.assigner = build_from_cfg(self.train_cfg.assigner, BOXES)
             # use PseudoSampler when sampling is False
             if self.sampling and hasattr(self.train_cfg, 'sampler'):
                 sampler_cfg = self.train_cfg.sampler
             else:
                 sampler_cfg = dict(type='PseudoSampler')
-            self.sampler = build_from_cfg(sampler_cfg, SAMPLER)
+            self.sampler = build_from_cfg(sampler_cfg, BOXES)
         self.fp16_enabled = False
 
         self.anchor_generator = build_from_cfg(anchor_generator, BOXES)
@@ -246,27 +247,26 @@ class AnchorHead(BaseDenseHead):
                 num_total_pos (int): Number of positive samples in all images
                 num_total_neg (int): Number of negative samples in all images
         """
-        inside_flags = anchor_inside_flags(flat_anchors, valid_flags,
+        inside_flags = rotated_anchor_inside_flags(flat_anchors, valid_flags,
                                            img_meta['img_shape'][:2],
                                            self.train_cfg.allowed_border)
         if not inside_flags.any():
-            return (None, ) * 6
+            return (None, ) * 7
         # assign gt and sample anchors
         anchors = flat_anchors[inside_flags, :]
 
+        # TODO: self.assign_by_circumhbbox
         assign_result = self.assigner.assign(
             anchors, gt_bboxes, gt_bboxes_ignore,
             None if self.sampling else gt_labels)
-        sampling_result = self.sampler.sample(assign_result, anchors,
-                                              gt_bboxes)
+
+        sampling_result = self.sampler.sample(assign_result, anchors, gt_bboxes)
 
         num_valid_anchors = anchors.shape[0]
-        bbox_targets = torch.zeros_like(anchors)
-        bbox_weights = torch.zeros_like(anchors)
-        labels = anchors.new_full((num_valid_anchors, ),
-                                  self.background_label,
-                                  dtype=torch.long)
-        label_weights = anchors.new_zeros(num_valid_anchors, dtype=torch.float)
+        bbox_targets = jt.zeros_like(anchors)
+        bbox_weights = jt.zeros_like(anchors)
+        labels = jt.full((num_valid_anchors, ), self.background_label).long()
+        label_weights = jt.zeros(num_valid_anchors, dtype=jt.float32)
 
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
@@ -1190,3 +1190,48 @@ class RRetinaRefineHead(RRetinaHead):
                                                 scale_factor, cfg, rescale)
             result_list.append(proposals)
         return result_list
+
+
+""" utils """
+def rotated_anchor_inside_flags(flat_anchors,
+                                valid_flags,
+                                img_shape,
+                                allowed_border=0):
+    """Check whether the rotated anchors are inside the border.
+
+    Args:
+        flat_anchors (torch.Tensor): Flatten anchors, shape (n, 5).
+        valid_flags (torch.Tensor): An existing valid flags of anchors.
+        img_shape (tuple(int)): Shape of current image.
+        allowed_border (int, optional): The border to allow the valid anchor.
+            Defaults to 0.
+
+    Returns:
+        jittor.Var: Flags indicating whether the anchors are inside a valid
+        range.
+    """
+    img_h, img_w = img_shape[:2]
+    if allowed_border >= 0:
+        cx, cy = (flat_anchors[:, i] for i in range(2))
+        inside_flags = \
+            valid_flags & \
+            (cx >= -allowed_border) & \
+            (cy >= -allowed_border) & \
+            (cx < img_w + allowed_border) & \
+            (cy < img_h + allowed_border)
+    else:
+        inside_flags = valid_flags
+
+    return inside_flags
+
+def unmap(data, count, inds, fill=0):
+    """Unmap a subset of item (data) back to the original set of items (of size
+    count)"""
+    if data.ndim == 1:
+        ret = jt.full((count, ), fill)
+        ret[jt.bool(inds)] = data
+    else:
+        new_size = (count, ) + data.size()[1:]
+        ret = jt.full(new_size, fill)
+        ret[jt.bool(inds), :] = data
+    return ret
