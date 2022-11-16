@@ -1,9 +1,14 @@
-from numpy import multiply
+from abc import ABCMeta, abstractmethod
+
 import jittor as jt 
 from jittor import nn
-from jdet.utils.registry import build_from_cfg,HEADS
+
+from jdet.utils.general import multi_apply, unmap
+from jdet.utils.registry import build_from_cfg
+from jdet.utils.registry import HEADS, BOXES, LOSSES
 from jdet.models.utils.modules import ConvModule
-from jdet.models.utils.weight_init import normal_init,bias_init_with_prob
+from jdet.models.utils.weight_init import normal_init, bias_init_with_prob
+from jdet.models.utils.bbox_nms_rotated import multiclass_nms_rotated
 
 class BaseDenseHead(nn.Module, metaclass=ABCMeta):
     """Base class for DenseHeads"""
@@ -66,27 +71,31 @@ class AnchorHead(BaseDenseHead):
                  in_channels,
                  feat_channels=256,
                  anchor_generator=dict(
-                     type='AnchorGenerator',
-                     scales=[8, 16, 32],
-                     ratios=[0.5, 1.0, 2.0],
-                     strides=[4, 8, 16, 32, 64]),
+                     type='RotatedAnchorGenerator',
+                     octave_base_scale=4,
+                     scales_per_octave=3,
+                     ratios=[1.0, 0.5, 2.0],
+                     strides=[8, 16, 32, 64, 128]),
                  bbox_coder=dict(
-                     type='DeltaXYWHBBoxCoder',
-                     target_means=(.0, .0, .0, .0),
-                     target_stds=(1.0, 1.0, 1.0, 1.0)),
+                     type='DeltaXYWHAOBBoxCoder',
+                     target_means=(.0, .0, .0, .0, .0),
+                     target_stds=(1.0, 1.0, 1.0, 1.0, 1.0)),
                  reg_decoded_bbox=False,
                  background_label=None,
                  loss_cls=dict(
-                     type='CrossEntropyLoss',
+                     type='FocalLoss',
                      use_sigmoid=True,
+                     gamma=2.0,
+                     alpha=0.25,
                      loss_weight=1.0),
                  loss_bbox=dict(
-                     type='SmoothL1Loss', beta=1.0 / 9.0, loss_weight=1.0),
+                     type='SmoothL1Loss',
+                     beta=1.0 / 9.0,
+                     loss_weight=1.0),
                  train_cfg=None,
                  test_cfg=None):
         super(AnchorHead, self).__init__()
         self.in_channels = in_channels
-        self.num_classes = num_classes
         self.feat_channels = feat_channels
         self.use_sigmoid_cls = loss_cls.get('use_sigmoid', False)
         # TODO better way to determine whether sample or not
@@ -106,22 +115,23 @@ class AnchorHead(BaseDenseHead):
         assert (self.background_label == 0
                 or self.background_label == num_classes)
 
-        self.bbox_coder = build_bbox_coder(bbox_coder)
-        self.loss_cls = build_loss(loss_cls)
-        self.loss_bbox = build_loss(loss_bbox)
+        self.reg_decoded_bbox = reg_decoded_bbox
+        self.bbox_coder = build_from_cfg(bbox_coder, BOXES)
+        self.loss_cls = build_from_cfg(loss_cls, LOSSES)
+        self.loss_bbox = build_from_cfg(loss_bbox, LOSSES)
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
         if self.train_cfg:
-            self.assigner = build_assigner(self.train_cfg.assigner)
+            self.assigner = build_from_cfg(self.train_cfg.assigner, BOXES)
             # use PseudoSampler when sampling is False
             if self.sampling and hasattr(self.train_cfg, 'sampler'):
                 sampler_cfg = self.train_cfg.sampler
             else:
                 sampler_cfg = dict(type='PseudoSampler')
-            self.sampler = build_sampler(sampler_cfg, context=self)
+            self.sampler = build_from_cfg(sampler_cfg, BOXES)
         self.fp16_enabled = False
 
-        self.anchor_generator = build_anchor_generator(anchor_generator)
+        self.anchor_generator = build_from_cfg(anchor_generator, BOXES)
         # usually the numbers of anchors for each level are the same
         # except SSD detectors
         self.num_anchors = self.anchor_generator.num_base_anchors[0]
@@ -132,16 +142,41 @@ class AnchorHead(BaseDenseHead):
                                   self.num_anchors * self.cls_out_channels, 1)
         self.conv_reg = nn.Conv2d(self.in_channels, self.num_anchors * 4, 1)
 
-    def init_weights(self):
-        normal_init(self.conv_cls, std=0.01)
-        normal_init(self.conv_reg, std=0.01)
-
     def forward_single(self, x):
+        """Forward feature of a single scale level.
+
+        Args:
+            x (jittor.Var): Features of a single scale level.
+
+        Returns:
+            tuple (jittor.Var):
+
+                - cls_score (jittor.Var): Cls scores for a single scale \
+                    level the channels number is num_anchors * num_classes.
+                - bbox_pred (jittor.Var): Box energies / deltas for a \
+                    single scale level, the channels number is num_anchors * 5.
+        """
         cls_score = self.conv_cls(x)
         bbox_pred = self.conv_reg(x)
         return cls_score, bbox_pred
 
     def forward(self, feats):
+        """Forward features from the upstream network.
+
+        Args:
+            feats (tuple[Tensor]): Features from the upstream network, each is
+                a 4D-tensor.
+
+        Returns:
+            tuple: A tuple of classification scores and bbox prediction.
+
+                - cls_scores (list[Tensor]): Classification scores for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_anchors * num_classes.
+                - bbox_preds (list[Tensor]): Box energies / deltas for all \
+                    scale levels, each is a 4D-tensor, the channels number \
+                    is num_anchors * 5.
+        """
         return multi_apply(self.forward_single, feats)
 
     def get_anchors(self, featmap_sizes, img_metas, device='cuda'):
@@ -213,27 +248,26 @@ class AnchorHead(BaseDenseHead):
                 num_total_pos (int): Number of positive samples in all images
                 num_total_neg (int): Number of negative samples in all images
         """
-        inside_flags = anchor_inside_flags(flat_anchors, valid_flags,
+        inside_flags = rotated_anchor_inside_flags(flat_anchors, valid_flags,
                                            img_meta['img_shape'][:2],
                                            self.train_cfg.allowed_border)
         if not inside_flags.any():
-            return (None, ) * 6
+            return (None, ) * 7
         # assign gt and sample anchors
         anchors = flat_anchors[inside_flags, :]
 
+        # TODO: self.assign_by_circumhbbox
         assign_result = self.assigner.assign(
             anchors, gt_bboxes, gt_bboxes_ignore,
             None if self.sampling else gt_labels)
-        sampling_result = self.sampler.sample(assign_result, anchors,
-                                              gt_bboxes)
+
+        sampling_result = self.sampler.sample(assign_result, anchors, gt_bboxes)
 
         num_valid_anchors = anchors.shape[0]
-        bbox_targets = torch.zeros_like(anchors)
-        bbox_weights = torch.zeros_like(anchors)
-        labels = anchors.new_full((num_valid_anchors, ),
-                                  self.background_label,
-                                  dtype=torch.long)
-        label_weights = anchors.new_zeros(num_valid_anchors, dtype=torch.float)
+        bbox_targets = jt.zeros_like(anchors)
+        bbox_weights = jt.zeros_like(anchors)
+        labels = jt.full((num_valid_anchors, ), self.background_label).long()
+        label_weights = jt.zeros(num_valid_anchors, dtype=jt.float32)
 
         pos_inds = sampling_result.pos_inds
         neg_inds = sampling_result.neg_inds
@@ -288,29 +322,29 @@ class AnchorHead(BaseDenseHead):
             multiple images.
 
         Args:
-            anchor_list (list[list[Tensor]]): Multi level anchors of each
+            anchor_list (list[list[Var]]): Multi level anchors of each
                 image. The outer list indicates images, and the inner list
                 corresponds to feature levels of the image. Each element of
-                the inner list is a tensor of shape (num_anchors, 4).
-            valid_flag_list (list[list[Tensor]]): Multi level valid flags of
+                the inner list is a Var of shape (num_anchors, 4).
+            valid_flag_list (list[list[Var]]): Multi level valid flags of
                 each image. The outer list indicates images, and the inner list
                 corresponds to feature levels of the image. Each element of
-                the inner list is a tensor of shape (num_anchors, )
-            gt_bboxes_list (list[Tensor]): Ground truth bboxes of each image.
+                the inner list is a Var of shape (num_anchors, )
+            gt_bboxes_list (list[Var]): Ground truth bboxes of each image.
             img_metas (list[dict]): Meta info of each image.
-            gt_bboxes_ignore_list (list[Tensor]): Ground truth bboxes to be
+            gt_bboxes_ignore_list (list[Var]): Ground truth bboxes to be
                 ignored.
-            gt_labels_list (list[Tensor]): Ground truth labels of each box.
+            gt_labels_list (list[Var]): Ground truth labels of each box.
             label_channels (int): Channel of label.
             unmap_outputs (bool): Whether to map outputs back to the original
                 set of anchors.
 
         Returns:
             tuple:
-                labels_list (list[Tensor]): Labels of each level
-                label_weights_list (list[Tensor]): Label weights of each level
-                bbox_targets_list (list[Tensor]): BBox targets of each level
-                bbox_weights_list (list[Tensor]): BBox weights of each level
+                labels_list (list[Var]): Labels of each level
+                label_weights_list (list[Var]): Label weights of each level
+                bbox_targets_list (list[Var]): BBox targets of each level
+                bbox_weights_list (list[Var]): BBox weights of each level
                 num_total_pos (int): Number of positive samples in all images
                 num_total_neg (int): Number of negative samples in all images
             additional_returns: This function enables user-defined returns from
@@ -329,8 +363,8 @@ class AnchorHead(BaseDenseHead):
         concat_valid_flag_list = []
         for i in range(num_imgs):
             assert len(anchor_list[i]) == len(valid_flag_list[i])
-            concat_anchor_list.append(torch.cat(anchor_list[i]))
-            concat_valid_flag_list.append(torch.cat(valid_flag_list[i]))
+            concat_anchor_list.append(jt.concat(anchor_list[i]))
+            concat_valid_flag_list.append(jt.concat(valid_flag_list[i]))
 
         # compute targets for each image
         if gt_bboxes_ignore_list is None:
@@ -375,13 +409,38 @@ class AnchorHead(BaseDenseHead):
 
     def loss_single(self, cls_score, bbox_pred, anchors, labels, label_weights,
                     bbox_targets, bbox_weights, num_total_samples):
+        """Compute loss of a single scale level.
+
+        Args:
+            cls_score (jittor.Var): Box scores for each scale level
+                Has shape (N, num_anchors * num_classes, H, W).
+            bbox_pred (jittor.Var): Box energies / deltas for each scale
+                level with shape (N, num_anchors * 5, H, W).
+            anchors (jittor.Var): Box reference for each scale level with
+                shape (N, num_total_anchors, 5).
+            labels (jittor.Var): Labels of each anchors with shape
+                (N, num_total_anchors).
+            label_weights (jittor.Var): Label weights of each anchor with
+                shape (N, num_total_anchors)
+            bbox_targets (jittor.Var): BBox regression targets of each anchor
+            weight shape (N, num_total_anchors, 5).
+            bbox_weights (jittor.Var): BBox regression loss weights of each
+                anchor with shape (N, num_total_anchors, 5).
+            num_total_samples (int): If sampling, num total samples equal to
+                the number of total anchors; Otherwise, it is the number of
+                positive anchors.
+
+        Returns:
+            tuple (jittor.Var):
+
+                - loss_cls (jittor.Var): cls. loss for each scale level.
+                - loss_bbox (jittor.Var): reg. loss for each scale level.
+        """
         # classification loss
         labels = labels.reshape(-1)
         label_weights = label_weights.reshape(-1)
-        cls_score = cls_score.permute(0, 2, 3,
-                                      1).reshape(-1, self.cls_out_channels)
-        loss_cls = self.loss_cls(
-            cls_score, labels, label_weights, avg_factor=num_total_samples)
+        cls_score = cls_score.permute(0, 2, 3, 1).reshape(-1, self.cls_out_channels)
+        loss_cls = self.loss_cls(cls_score, labels, label_weights, avg_factor=num_total_samples)
         # regression loss
         bbox_targets = bbox_targets.reshape(-1, 4)
         bbox_weights = bbox_weights.reshape(-1, 4)
@@ -396,7 +455,7 @@ class AnchorHead(BaseDenseHead):
             avg_factor=num_total_samples)
         return loss_cls, loss_bbox
 
-    @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
+    # TODO: @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
     def loss(self,
              cls_scores,
              bbox_preds,
@@ -407,10 +466,9 @@ class AnchorHead(BaseDenseHead):
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         assert len(featmap_sizes) == self.anchor_generator.num_levels
 
-        device = cls_scores[0].device
-
+        # device set to 'cuda'
         anchor_list, valid_flag_list = self.get_anchors(
-            featmap_sizes, img_metas, device=device)
+            featmap_sizes, img_metas)
         label_channels = self.cls_out_channels if self.use_sigmoid_cls else 1
         cls_reg_targets = self.get_targets(
             anchor_list,
@@ -432,7 +490,7 @@ class AnchorHead(BaseDenseHead):
         # concat all level anchors and flags to a single tensor
         concat_anchor_list = []
         for i in range(len(anchor_list)):
-            concat_anchor_list.append(torch.cat(anchor_list[i]))
+            concat_anchor_list.append(jt.concat(anchor_list[i]))
         all_anchor_list = images_to_levels(concat_anchor_list,
                                            num_level_anchors)
 
@@ -448,7 +506,7 @@ class AnchorHead(BaseDenseHead):
             num_total_samples=num_total_samples)
         return dict(loss_cls=losses_cls, loss_bbox=losses_bbox)
 
-    @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
+    # TODO: @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
     def get_bboxes(self,
                    cls_scores,
                    bbox_preds,
@@ -462,11 +520,15 @@ class AnchorHead(BaseDenseHead):
             cls_scores (list[Tensor]): Box scores for each scale level
                 Has shape (N, num_anchors * num_classes, H, W)
             bbox_preds (list[Tensor]): Box energies / deltas for each scale
-                level with shape (N, num_anchors * 4, H, W)
-            img_metas (list[dict]): Size / scale info for each image
-            cfg (mmcv.Config): Test / postprocessing configuration,
+                level with shape (N, num_anchors * 5, H, W)
+            img_metas (list[dict]): Meta information of each image, e.g.,
+                image size, scaling factor, etc.
+            cfg (mmcv.Config | None): Test / postprocessing configuration,
                 if None, test_cfg would be used
-            rescale (bool): If True, return boxes in original image space
+            rescale (bool): If True, return boxes in original image space.
+                Default: False.
+            with_nms (bool): If True, do nms before return boxes.
+                Default: True.
 
         Returns:
             list[tuple[Tensor, Tensor]]: Each item in result_list is 2-tuple.
@@ -505,10 +567,9 @@ class AnchorHead(BaseDenseHead):
         assert len(cls_scores) == len(bbox_preds)
         num_levels = len(cls_scores)
 
-        device = cls_scores[0].device
         featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
         mlvl_anchors = self.anchor_generator.grid_anchors(
-            featmap_sizes, device=device)
+            featmap_sizes) # device set to 'cuda'
 
         result_list = []
         for img_id in range(len(img_metas)):
@@ -533,9 +594,33 @@ class AnchorHead(BaseDenseHead):
                            img_shape,
                            scale_factor,
                            cfg,
-                           rescale=False):
+                           rescale=False,
+                           with_nms=True):
         """
         Transform outputs for a single batch item into labeled boxes.
+
+        Args:
+            cls_score_list (list[Tensor]): Box scores for a single scale level
+                Has shape (num_anchors * num_classes, H, W).
+            bbox_pred_list (list[Tensor]): Box energies / deltas for a single
+                scale level with shape (num_anchors * 4, H, W).
+            mlvl_anchors (list[Tensor]): Box reference for a single scale level
+                with shape (num_total_anchors, 4).
+            img_shape (tuple[int]): Shape of the input image,
+                (height, width, 3).
+            scale_factor (ndarray): Scale factor of the image arange as
+                (w_scale, h_scale, w_scale, h_scale).
+            cfg (mmcv.Config): Test / postprocessing configuration,
+                if None, test_cfg would be used.
+            rescale (bool): If True, return boxes in original image space.
+                Default: False.
+            with_nms (bool): If True, do nms before return boxes.
+                Default: True.
+
+        Returns:
+            Tensor: Labeled boxes in shape (n, 5), where the first 4 columns
+                are bounding box positions (cx, cy, w, h, a) and the
+                6-th column is a score between 0 and 1.
         """
         cfg = self.test_cfg if cfg is None else cfg
         assert len(cls_score_list) == len(bbox_pred_list) == len(mlvl_anchors)
@@ -569,24 +654,30 @@ class AnchorHead(BaseDenseHead):
                 anchors, bbox_pred, max_shape=img_shape)
             mlvl_bboxes.append(bboxes)
             mlvl_scores.append(scores)
-        mlvl_bboxes = torch.cat(mlvl_bboxes)
+        mlvl_bboxes = jt.concat(mlvl_bboxes)
         if rescale:
-            mlvl_bboxes /= mlvl_bboxes.new_tensor(scale_factor)
-        mlvl_scores = torch.cat(mlvl_scores)
+            # angle should not be rescaled
+            mlvl_bboxes[:, :4] = mlvl_bboxes[:, :4] / scale_factor
+        mlvl_scores = jt.concat(mlvl_scores)
         if self.use_sigmoid_cls:
             # Add a dummy background class to the backend when using sigmoid
             # remind that we set FG labels to [0, num_class-1] since mmdet v2.0
             # BG cat_id: num_class
             padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
-            mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
-        det_bboxes, det_labels = multiclass_nms(mlvl_bboxes, mlvl_scores,
-                                                cfg.score_thr, cfg.nms,
-                                                cfg.max_per_img)
-        return det_bboxes, det_labels
+            mlvl_scores = jt.concat([mlvl_scores, padding], dim=1)
+
+        if with_nms:
+            # TODO: multiclass_nms_rotated
+            det_bboxes, det_labels = multiclass_nms_rotated(
+                mlvl_bboxes, mlvl_scores, cfg.score_thr, cfg.nms,
+                cfg.max_per_img)
+            return det_bboxes, det_labels
+        else:
+            return mlvl_bboxes, mlvl_scores
 
 
 @HEADS.register_module()
-class RRetinaHead(nn.Module):
+class RRetinaHead(AnchorHead):
     """Rotational Anchor-based head
 
     Args:
@@ -684,6 +775,19 @@ class RRetinaHead(nn.Module):
         normal_init(self.retina_reg, std=0.01)
 
     def forward_single(self, x):
+        """Forward feature of a single scale level.
+
+        Args:
+            x (torch.Tensor): Features of a single scale level.
+
+        Returns:
+            tuple (torch.Tensor):
+
+                - cls_score (torch.Tensor): Cls scores for a single scale \
+                    level the channels number is num_anchors * num_classes.
+                - bbox_pred (torch.Tensor): Box energies / deltas for a \
+                    single scale level, the channels number is num_anchors * 5.
+        """
         cls_feat = x
         reg_feat = x
         for cls_conv in self.cls_convs:
@@ -760,11 +864,11 @@ class RRetinaHead(nn.Module):
                                               gt_bboxes)
 
         num_valid_anchors = anchors.shape[0]
-        bbox_targets = torch.zeros_like(anchors)
-        bbox_weights = torch.zeros_like(anchors)
+        bbox_targets = jt.zeros_like(anchors)
+        bbox_weights = jt.zeros_like(anchors)
         labels = anchors.new_full((num_valid_anchors,),
                                   self.background_label,
-                                  dtype=torch.long)
+                                  dtype=jt.long)
         label_weights = anchors.new_zeros(num_valid_anchors, dtype=torch.float)
 
         pos_inds = sampling_result.pos_inds
@@ -804,356 +908,54 @@ class RRetinaHead(nn.Module):
         return (labels, label_weights, bbox_targets, bbox_weights, pos_inds,
                 neg_inds, sampling_result)
 
-    def loss_single(self, cls_score, bbox_pred, anchors, labels, label_weights,
-                    bbox_targets, bbox_weights, num_total_samples):
-        # classification loss
-        labels = labels.reshape(-1)
-        label_weights = label_weights.reshape(-1)
-        cls_score = cls_score.permute(0, 2, 3,
-                                      1).reshape(-1, self.cls_out_channels)
-        loss_cls = self.loss_cls(
-            cls_score, labels, label_weights, avg_factor=num_total_samples)
-        # regression loss
-        bbox_targets = bbox_targets.reshape(-1, 5)
-        bbox_weights = bbox_weights.reshape(-1, 5)
-        bbox_pred = bbox_pred.permute(0, 2, 3, 1).reshape(-1, 5)
-        if self.reg_decoded_bbox:
-            anchors = anchors.reshape(-1, 5)
-            bbox_pred = self.bbox_coder.decode(anchors, bbox_pred)
-        loss_bbox = self.loss_bbox(
-            bbox_pred,
-            bbox_targets,
-            bbox_weights,
-            avg_factor=num_total_samples)
-        return loss_cls, loss_bbox
-
-    def filter_bboxes(self,
-                      cls_scores,
-                      bbox_preds):
-        """
-                Filter predicted bounding boxes at each position of the feature maps.
-                Only one bounding boxes with highest score will be left at each position.
-                This filter will be used in R3Det prior to the first feature refinement stage.
-
-                Args:
-                    cls_scores (list[Tensor]): Box scores for each scale level
-                        Has shape (N, num_anchors * num_classes, H, W)
-                    bbox_preds (list[Tensor]): Box energies / deltas for each scale
-                        level with shape (N, num_anchors * 5, H, W)
-
-                Returns:
-                    list[list[Tensor]]: best or refined rbboxes of each level of each image.
-        """
-        num_levels = len(cls_scores)
-        assert num_levels == len(bbox_preds)
-
-        num_imgs = cls_scores[0].size(0)
-
-        for i in range(num_levels):
-            assert num_imgs == cls_scores[i].size(0) == bbox_preds[i].size(0)
-
-        device = cls_scores[0].device
-        featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
-        mlvl_anchors = self.anchor_generator.grid_anchors(
-            featmap_sizes, device=device)
-
-        bboxes_list = [[] for _ in range(num_imgs)]  # list(indexed by images) of list(indexed by levels)
-
-        for lvl in range(num_levels):
-            cls_score = cls_scores[lvl]
-            bbox_pred = bbox_preds[lvl]
-
-            anchors = mlvl_anchors[lvl]
-
-            cls_score = cls_score.permute(0, 2, 3, 1)  # (N, H, W, A*C)
-            cls_score = cls_score.reshape(num_imgs, -1, self.num_anchors, self.cls_out_channels)  # (N, H*W, A, C)
-
-            cls_score, _ = cls_score.max(dim=-1, keepdim=True)  # (N, H*W, A, 1)
-            best_ind = cls_score.argmax(dim=-2, keepdim=True)  # (N, H*W, 1, 1)
-            best_ind = best_ind.expand(-1, -1, -1, 5)  # (N, H*W, 1, 5)
-
-            bbox_pred = bbox_pred.permute(0, 2, 3, 1)  # (N, H, W, A*5)
-            bbox_pred = bbox_pred.reshape(num_imgs, -1, self.num_anchors, 5)  # (N, H*W, A, 5)
-
-            best_pred = bbox_pred.gather(dim=-2, index=best_ind).squeeze(dim=-2)  # (N, H*W, 5)
-
-            # anchors shape (H*W*A, 5)
-            anchors = anchors.reshape(-1, self.num_anchors, 5)  # (H*W, A, 5)
-
-            for img_id in range(num_imgs):
-                best_ind_i = best_ind[img_id]  # (H*W, 1, 5)
-                best_pred_i = best_pred[img_id]  # (H*W, 5)
-                best_anchor_i = anchors.gather(dim=-2, index=best_ind_i).squeeze(dim=-2)  # (H*W, 5)
-                best_bbox_i = self.bbox_coder.decode(best_anchor_i, best_pred_i)
-                bboxes_list[img_id].append(best_bbox_i.detach())
-
-        return bboxes_list
-
-    def _get_bboxes_single(self,
-                           cls_score_list,
-                           bbox_pred_list,
-                           mlvl_anchors,
-                           img_shape,
-                           scale_factor,
-                           cfg,
-                           rescale=False):
-        """
-        Transform outputs for a single batch item (a single image) into labeled boxes.
-
-        Args:
-            cls_score_list (list[Tensor]): Box scores for each scale level of a single image
-                Has shape (num_anchors * num_classes, H, W)
-            bbox_pred_list (list[Tensor]): Box energies / deltas for each scale of a single image
-                Has shape (num_anchors * 5, H, W)
-            mlvl_anchors (list[Tensor]): Anchors for each scale of a single image
-                Has shape (H * W * num_anchors, 5)
-            img_shape tuple[int, int]: Image size
-            scale_factor float: Image scale factor
-            cfg (mmcv.Config): test / postprocessing configuration
-            rescale (bool): if True, return boxes in original image space
-        """
-        cfg = self.test_cfg if cfg is None else cfg
-        assert len(cls_score_list) == len(bbox_pred_list) == len(mlvl_anchors)
-        mlvl_bboxes = []
-        mlvl_scores = []
-        for cls_score, bbox_pred, anchors in zip(cls_score_list,
-                                                 bbox_pred_list, mlvl_anchors):
-            assert cls_score.size()[-2:] == bbox_pred.size()[-2:]
-            cls_score = cls_score.permute(1, 2,
-                                          0).reshape(-1, self.cls_out_channels)
-            if self.use_sigmoid_cls:
-                scores = cls_score.sigmoid()
-            else:
-                scores = cls_score.softmax(-1)
-            bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 5)
-            nms_pre = cfg.get('nms_pre', -1)
-            if nms_pre > 0 and scores.shape[0] > nms_pre:
-                # Get maximum scores for foreground classes.
-                if self.use_sigmoid_cls:
-                    max_scores, _ = scores.max(dim=1)
-                else:
-                    # remind that we set FG labels to [0, num_class-1]
-                    # since mmdet v2.0
-                    # BG cat_id: num_class
-                    max_scores, _ = scores[:, :-1].max(dim=1)
-                _, topk_inds = max_scores.topk(nms_pre)
-                anchors = anchors[topk_inds, :]
-                bbox_pred = bbox_pred[topk_inds, :]
-                scores = scores[topk_inds, :]
-            bboxes = self.bbox_coder.decode(
-                anchors, bbox_pred, max_shape=img_shape)
-            mlvl_bboxes.append(bboxes)
-            mlvl_scores.append(scores)
-        mlvl_bboxes = torch.cat(mlvl_bboxes)
-        if rescale:
-            # angle should not be rescaled
-            mlvl_bboxes[:, :4] = mlvl_bboxes[:, :4] / mlvl_bboxes.new_tensor(scale_factor)
-        mlvl_scores = torch.cat(mlvl_scores)
-        if self.use_sigmoid_cls:
-            # Add a dummy background class to the backend when using sigmoid
-            # remind that we set FG labels to [0, num_class-1] since mmdet v2.0
-            # BG cat_id: num_class
-            padding = mlvl_scores.new_zeros(mlvl_scores.shape[0], 1)
-            mlvl_scores = torch.cat([mlvl_scores, padding], dim=1)
-        det_bboxes, det_labels = multiclass_rnms(mlvl_bboxes, mlvl_scores,
-                                                 cfg.score_thr, cfg.nms,
-                                                 cfg.max_per_img)
-        return det_bboxes, det_labels
-
     def execute(self,features):
-        outs = 
+        pass
 
 
-
-@HEADS.register_module()
-class RRetinaRefineHead(RRetinaHead):
-    """Rotational Anchor-based refine head
+""" utils """
+def rotated_anchor_inside_flags(flat_anchors,
+                                valid_flags,
+                                img_shape,
+                                allowed_border=0):
+    """Check whether the rotated anchors are inside the border.
 
     Args:
-        num_classes (int): Number of categories excluding the background
-            category.
-        in_channels (int): Number of channels in the input feature map.
-        feat_channels (int): Number of hidden channels. Used in child classes.
-        anchor_generator (dict): Config dict for anchor generator
-        bbox_coder (dict): Config of bounding box coder.
-        reg_decoded_bbox (bool): If true, the regression loss would be
-            applied on decoded bounding boxes. Default: False
-        background_label (int | None): Label ID of background, set as 0 for
-            RPN and num_classes for other heads. It will automatically set as
-            num_classes if None is given.
-        loss_cls (dict): Config of classification loss.
-        loss_bbox (dict): Config of localization loss.
-        train_cfg (dict): Training config of anchor head.
-        test_cfg (dict): Testing config of anchor head.
-    """  # noqa: W605
+        flat_anchors (jittor.Var): Flatten anchors, shape (n, 5).
+        valid_flags (jittor.Var): An existing valid flags of anchors.
+        img_shape (tuple(int)): Shape of current image.
+        allowed_border (int, optional): The border to allow the valid anchor.
+            Defaults to 0.
 
-    def __init__(self,
-                 num_classes,
-                 in_channels,
-                 stacked_convs=4,
-                 conv_cfg=None,
-                 norm_cfg=None,
-                 anchor_generator=dict(
-                     type='PseudoAnchorGenerator',
-                     strides=[8, 16, 32, 64, 128]),
-                 bbox_coder=dict(
-                     type='DeltaXYWHABBoxCoder',
-                     target_means=(.0, .0, .0, .0, .0),
-                     target_stds=(1.0, 1.0, 1.0, 1.0, 1.0)),
-                 **kwargs):
+    Returns:
+        jittor.Var: Flags indicating whether the anchors are inside a valid
+        range.
+    """
+    img_h, img_w = img_shape[:2]
+    if allowed_border >= 0:
+        cx, cy = (flat_anchors[:, i] for i in range(2))
+        inside_flags = \
+            valid_flags & \
+            (cx >= -allowed_border) & \
+            (cy >= -allowed_border) & \
+            (cx < img_w + allowed_border) & \
+            (cy < img_h + allowed_border)
+    else:
+        inside_flags = valid_flags
 
-        self.bboxes_as_anchors = None
-        super(RRetinaRefineHead, self).__init__(
-            num_classes=num_classes,
-            in_channels=in_channels,
-            stacked_convs=stacked_convs,
-            conv_cfg=conv_cfg,
-            norm_cfg=norm_cfg,
-            use_h_gt=False,
-            anchor_generator=anchor_generator,
-            bbox_coder=bbox_coder,
-            **kwargs)
-
-    def refine_bboxes(self,
-                      cls_scores,
-                      bbox_preds,
-                      rois):
-        """
-                Refine predicted bounding boxes at each position of the feature maps.
-                This method will be used in R3Det in refinement stages.
-
-                Args:
-                    cls_scores (list[Tensor]): Box scores for each scale level
-                        Has shape (N, num_classes, H, W)
-                    bbox_preds (list[Tensor]): Box energies / deltas for each scale
-                        level with shape (N, 5, H, W)
-                    rois (list[list[Tensor]]): input rbboxes of each level of each image.
-                        rois output by former stages and are to be refined
-
-                Returns:
-                    list[list[Tensor]]: best or refined rbboxes of each level of each image.
-        """
-        num_levels = len(cls_scores)
-        assert num_levels == len(bbox_preds)
-
-        num_imgs = cls_scores[0].size(0)
-
-        for i in range(num_levels):
-            assert num_imgs == cls_scores[i].size(0) == bbox_preds[i].size(0)
-
-        bboxes_list = [[] for _ in range(num_imgs)]  # list(indexed by images) of list(indexed by levels)
-
-        assert rois is not None
-        # rois is a list of lists. outer list is indexed by images, while inner lists are indexed by levels
-        mlvl_rois = [torch.cat(r) for r in zip(*rois)]
-
-        for lvl in range(num_levels):
-            bbox_pred = bbox_preds[lvl]
-            rois = mlvl_rois[lvl]  # (N*H*W, 5)
-            assert bbox_pred.size(1) == 5
-            bbox_pred = bbox_pred.permute(0, 2, 3, 1)  # (N, H, W, 5)
-            bbox_pred = bbox_pred.reshape(-1, 5)  # (N*H*W, 5)
-            refined_bbox = self.bbox_coder.decode(rois, bbox_pred)  # (N*H*W, 5)
-            refined_bbox = refined_bbox.reshape(num_imgs, -1, 5)  # (N, H*W, 5)
-            for img_id in range(num_imgs):
-                bboxes_list[img_id].append(refined_bbox[img_id].detach())
-        return bboxes_list
-
-    def get_anchors(self, featmap_sizes, img_metas, device='cuda'):
-        """Get anchors according to feature map sizes.
-
-        Args:
-            featmap_sizes (list[tuple]): Multi-level feature map sizes.
-            img_metas (list[dict]): Image meta info.
-            bboxes_as_anchors (list[list[Tensor]]) bboxes of levels of images.
-                before further regression just like anchors.
-            device (torch.device | str): Device for returned tensors
-
-        Returns:
-            tuple:
-                anchor_list (list[Tensor]): Anchors of each image
-                valid_flag_list (list[Tensor]): Valid flags of each image
-        """
-        anchor_list = [
-            [bboxes_img_lvl.clone().detach() for bboxes_img_lvl in bboxes_img]
-            for bboxes_img in self.bboxes_as_anchors]
-
-        # for each image, we compute valid flags of multi level anchors
-        valid_flag_list = []
-        for img_id, img_meta in enumerate(img_metas):
-            multi_level_flags = self.anchor_generator.valid_flags(featmap_sizes,
-                                                                  img_meta['pad_shape'],
-                                                                  device)
-            valid_flag_list.append(multi_level_flags)
-
-        return anchor_list, valid_flag_list
+    return inside_flags
 
 
-    def loss(self,
-             cls_scores,
-             bbox_preds,
-             gt_bboxes,
-             gt_labels,
-             img_metas,
-             rois=None,
-             gt_bboxes_ignore=None):
+def images_to_levels(target, num_levels):
+    """Convert targets by image to targets by feature level.
 
-        assert rois is not None
-        self.bboxes_as_anchors = rois
-        return super(RRetinaRefineHead, self).loss(cls_scores=cls_scores,
-                                                   bbox_preds=bbox_preds,
-                                                   gt_bboxes=gt_bboxes,
-                                                   gt_labels=gt_labels,
-                                                   img_metas=img_metas,
-                                                   gt_bboxes_ignore=gt_bboxes_ignore)
-
-    @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
-    def get_bboxes(self,
-                   cls_scores,
-                   bbox_preds,
-                   img_metas,
-                   cfg=None,
-                   rescale=False,
-                   rois=None):
-        """
-        Transform network output for a batch into labeled boxes.s
-
-        Args:
-            cls_scores (list[Tensor]): Box scores for each scale level
-                Has shape (N, num_anchors * num_classes, H, W)
-            bbox_preds (list[Tensor]): Box energies / deltas for each scale
-                level with shape (N, num_anchors * 5, H, W)
-            img_metas (list[dict]): size / scale info for each image
-            cfg (mmcv.Config): test / postprocessing configuration
-            rois (list[list[Tensor]]): input rbboxes of each level of each image.
-                rois output by former stages and are to be refined
-            rescale (bool): if True, return boxes in original image space
-
-        Returns:
-            list[tuple[Tensor, Tensor]]: each item in result_list is 2-tuple.
-                The first item is an (n, 6) tensor, where the first 5 columns
-                are bounding box positions (xc, yc, w, h, a) and the
-                6-th column is a score between 0 and 1. The second item is a
-                (n,) tensor where each item is the class index of the
-                corresponding box.
-        """
-        num_levels = len(cls_scores)
-        assert len(cls_scores) == len(bbox_preds)
-        assert rois is not None
-
-        result_list = []
-
-        for img_id in range(len(img_metas)):
-            cls_score_list = [
-                cls_scores[i][img_id].detach() for i in range(num_levels)
-            ]
-            bbox_pred_list = [
-                bbox_preds[i][img_id].detach() for i in range(num_levels)
-            ]
-            img_shape = img_metas[img_id]['img_shape']
-            scale_factor = img_metas[img_id]['scale_factor']
-            proposals = self._get_bboxes_single(cls_score_list, bbox_pred_list,
-                                                rois[img_id], img_shape,
-                                                scale_factor, cfg, rescale)
-            result_list.append(proposals)
-        return result_list
+    [target_img0, target_img1] -> [target_level0, target_level1, ...]
+    """
+    target = jt.stack(target, 0)
+    level_targets = []
+    start = 0
+    for n in num_levels:
+        end = start + n
+        # level_targets.append(target[:, start:end].squeeze(0))
+        level_targets.append(target[:, start:end])
+        start = end
+    return level_targets
